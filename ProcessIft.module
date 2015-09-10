@@ -1,0 +1,603 @@
+<?php
+
+/**
+ * Interactive process for configuring and managing Ift triggers/actions
+ *
+ */
+
+class ProcessIft extends Process {
+
+	public static function getModuleInfo() {
+		return array(
+			'title' => 'Triggers/Actions', 
+			'summary' => 'Interactive definition tool for "if then" triggers and actions.', 
+			'version' => 16, 
+			'author' => 'Avoine and ProcessWire', 
+			'permission' => 'ift-edit', 
+			'requires' => 'IftRunner',
+			'icon' => 'flask', 
+			); 
+	}
+
+	/**
+	 * Page name where the Ift process will live
+	 *
+	 */
+	const pageName = 'ift';
+
+	/**
+	 * Labels for reusable i18n translations
+	 *
+ 	 */
+	protected $labels = array(); 
+	
+	/**
+	 * Instance of IftRunner
+	 *
+	 */
+	protected $ift = null;
+
+	/**
+	 * Instance of IftTriggers
+	 *
+	 */
+	protected $triggers = null;
+
+	/**
+	 * Predefined hooks to assign to triggers indexed by hook name with label as value
+	 *
+	 */
+	protected $hookOptions = array();
+
+	/**
+	 * Initialize the Process and establish default values
+	 *
+	 */
+	public function init() {
+
+		parent::init(); // required
+
+		$this->labels = array(
+			'Yes' => $this->_('Yes'),
+			'No' => $this->_('No'),
+			'On' => $this->_('On'), 
+			'Off' => $this->_('Off'), 
+			'Add New' => $this->_('Add New'),
+			'Queue' => $this->_('Queue'),
+			'Before' => $this->_('Before'), 
+			'After' => $this->_('After'), 
+			'Later' => $this->_('Later'), 
+			'dateFormat' => $this->_('Y/m/d'),
+			'dateTimeFormat' => $this->_('Y/m/d H:i'),
+			);
+
+		$this->ift = $this->wire('modules')->get('IftRunner'); 
+		$this->triggers = $this->ift->triggers; 
+
+		$this->hookOptions = array(
+			'Pages::saveReady' => $this->_('Page ready to save'), 
+			'Pages::saved' => $this->_('Page saved'),  
+			'Pages::added' => $this->_('Page added'),
+			'Pages::deleteReady' => $this->_('Page ready to delete'), 
+			'Pages::deleted' => $this->_('Page deleted'), 
+			'Pages::cloneReady' => $this->_('Page ready to be cloned'), 
+			'Pages::cloned' => $this->_('Page cloned'), 
+			'Pages::moved' => $this->_('Page moved'), 
+			'Pages::renamed' => $this->_('Page renamed'), 
+			'Pages::statusChangeReady' => $this->_('Page status changed and ready to save'), 
+			'Pages::statusChanged' => $this->_('Page status changed and saved'), 
+			'Pages::templateChanged' => $this->_('Page template changed'), 
+			'Pages::trashed' => $this->_('Page trashed'),
+			'Pages::restored' => $this->_('Page restored'),
+			'Pages::publishReady' => $this->_('Page ready to publish'), 
+			'Pages::published' => $this->_('Page published'), 
+			'Pages::unpublishReady' => $this->_('Page ready to unpublish'), 
+			'Pages::unpublished' => $this->_('Page unpublished'), 
+			'Page::loaded' => $this->_('Page loaded in memory'), 
+			'Page::render' => $this->_('Page render'), 
+			'Page::changed' => $this->_('Page field changed'), 
+			'Session::loginSuccess' => $this->_('User logged in'), 
+			'Session::logoutSuccess' => $this->_('User logged out'), 
+			);
+	}
+
+	/**
+	 * Execute the main listing of Ift triggers
+	 *
+	 */
+	public function ___execute() {
+
+		$sanitizer = $this->wire('sanitizer');
+		$form = $this->wire('modules')->get('InputfieldForm'); 
+
+		$table = $this->wire('modules')->get('MarkupAdminDataTable'); 
+		$table->setEncodeEntities(false);
+		$table->headerRow(array(
+			$this->_x('Title', 'thead-title'), 
+			$this->_x('Hook', 'thead-hook'), 
+			$this->_x('When', 'thead-actions'), 
+			$this->_x('Condition', 'thead-condition'), 
+			$this->_x('Action(s)', 'thead-actions'), 
+			$this->_x('Status', 'thead-active') 
+			));
+		$out = '';
+		$n = 0;
+
+		foreach($this->triggers->getAll() as $trigger) {
+
+			$edit = "./edit?id=$trigger->id"; 
+
+			$actionsInfo = array();
+			foreach($trigger->actions as $action) {
+				$moduleInfo = $this->wire('modules')->getModuleInfo($action); 
+				$actionsInfo[] = $moduleInfo['title'];	
+			}
+
+			$when = '';
+			if($trigger->flags & IftTrigger::flagsLater) $when = $this->labels['Later'];
+				else if($trigger->flags & IftTrigger::flagsAfter) $when = $this->labels['After']; 
+				else if($trigger->flags & IftTrigger::flagsBefore) $when = $this->labels['Before']; 
+
+			$table->row(array(
+				$sanitizer->entities($trigger->title) => $edit, 
+				$trigger->hook, 
+				$when,
+				$sanitizer->entities($trigger->condition), 
+				nl2br($sanitizer->entities(implode("\n", $actionsInfo))), 
+				($trigger->flags & IftTrigger::flagsActive ? $this->labels['On'] : $this->labels['Off'])
+				));
+			$n++;
+		}
+
+		$button1 = $this->wire('modules')->get('InputfieldButton'); 
+		$button1->attr('name', 'submit_add_new'); 
+		$button1->addClass('head_button_clone');
+		$button1->attr('href', './edit?id=0'); 
+		$button1->attr('value', $this->labels['Add New']); 
+		$button1->icon = 'plus-circle';
+		$form->add($button1); 
+
+		$button2 = $this->wire('modules')->get('InputfieldButton'); 
+		$button2->addClass('ui-priority-secondary'); 
+		$button2->attr('name', 'submit_queue'); 
+		$button2->attr('href', './queue/'); 
+		$button2->attr('value', $this->labels['Queue']); 
+		$button2->icon = 'tasks';
+		$form->add($button2); 
+
+		if(!$n) $form->description = $this->_('No triggers defined yet.');
+		$out = $table->render() . $form->render();
+
+		return $out; 
+	}	
+
+	/**
+	 * Execute edit or add trigger
+	 *
+	 * Add trigger is assumed if 'id' GET variable is 0 or unset
+	 *
+	 */
+	public function ___executeEdit() {
+
+		$id = (int) $this->input->get('id'); 
+		$trigger = $id ? $this->triggers->get($id) : $this->triggers->getNew();
+		if(!$trigger) throw new WireException("Unknown trigger"); 
+
+		$info = self::getModuleInfo();
+		$this->wire('breadcrumbs')->add(new Breadcrumb('./', $info['title'])); 
+		$this->wire('processHeadline', $id ? $this->_('Edit Trigger') : $this->labels['Add New']); 
+
+		$form = $this->buildEdit($trigger); 
+		$post = $this->wire('input')->post; 
+
+		if($post->delete == $trigger->id && $post->submit_delete) {
+			$this->triggers->delete($trigger);
+			$this->message($this->_('Deleted trigger') . ' - ' . $trigger->title); 
+			return $this->wire('session')->redirect('./'); 
+		}
+
+		if($post->submit_save || $post->submit_save_exit) {
+			$this->processEdit($form, $trigger); 
+			$errors = $form->getErrors();
+			$this->triggers->save($trigger); 
+			$this->message($this->_('Saved Trigger')); 
+			$url = $post->submit_save_exit ? "./" : "./edit?id=$trigger->id";
+			return $this->wire('session')->redirect($url); 
+		}
+		
+		return $form->render();
+	}
+
+	/**
+	 * Build the form for executeEdit() 
+	 *
+	 */
+	protected function ___buildEdit(IftTrigger $trigger) {
+
+		$form = $this->wire('modules')->get('InputfieldForm'); 		
+		$form->attr('action', "./edit?id=$trigger->id"); 
+		$form->attr('method', 'post'); 
+
+		$f = $this->wire('modules')->get('InputfieldText'); 
+		$f->attr('name', 'title'); 
+		$f->attr('value', $trigger->title); 
+		$f->required = true; 
+		$f->label = $this->_('Title'); 
+		$f->description = $this->_('Short description of what this trigger and action does.'); 
+		$f->columnWidth = 75; 
+		$form->add($f); 
+
+		$f = $this->wire('modules')->get('InputfieldRadios'); 	
+		$f->attr('name', 'flag_active'); 
+		$f->label = $this->_('Status'); 
+		$f->addOption(IftTrigger::flagsActive, $this->labels['On']); 
+		$f->addOption(0, $this->labels['Off']); 
+		if($trigger->flags & IftTrigger::flagsActive) $f->attr('value', IftTrigger::flagsActive); 
+			else $f->attr('value', 0); 
+		$f->columnWidth = 25; 
+		$form->add($f); 
+
+
+		$f = $this->wire('modules')->get('InputfieldSelect'); 
+		$f->attr('name', 'hook_option'); 
+		foreach($this->hookOptions as $hook => $label) {
+			$f->addOption($hook, "$label"); 
+		}
+		$f->attr('value', $trigger->hook); 
+		$f->label = $this->_('Choose a hook'); 
+		$f->description = $this->_('If you want to use a hook that is not here, enter it manually in the next field.'); 
+		$f->columnWidth = 50; 
+		$f->attr('onchange', "if($(this).val().length>0) $('#Inputfield_hook').val($(this).val());"); 
+		$form->add($f);
+
+		$f = $this->wire('modules')->get('InputfieldText'); 
+		$f->attr('name', 'hook'); 
+		$f->attr('value', $trigger->hook); 
+		$f->required = true; 
+		$f->label = $this->_('Hook'); 
+		$f->description = $this->_('If you select a value to the left, this will be populated automatically.'); 
+		$f->columnWidth = 50; 
+		$form->add($f); 
+
+		$f = $this->wire('modules')->get('InputfieldSelector'); 
+		$f->attr('name', 'condition'); 
+		$f->attr('value', $trigger->condition); 
+		$f->label = $this->_('Conditions required to run'); 
+		$f->addLabel = $this->_('Add Condition'); 
+		$f->preview = false;
+		$f->description = $this->_('Optionally add one or more conditions required for the action(s) to run. The page sent to the trigger must match the conditions you select here before any actions will be run on it. For example, if you wanted the actions to only run for pages of type "User" then you would specify a template of user.'); // conditions description
+		$form->add($f); 
+
+		$f = $this->wire('modules')->get('InputfieldText'); 
+		$f->attr('name', 'fieldChanges'); 
+		$f->attr('value', implode(' ', $trigger->fieldChanges)); 
+		$f->label = $this->_('Run only if field changes'); 
+		$f->description = $this->_('If you only want the action to run if a certain field changes enter the names of the field(s) here. If any one of these fields change, the action(s) will be run.'); 
+		$f->notes = $this->_('**If entering multiple field names:** separate each with a space. At least one of the field names is required to have changed in order for the action to run.') . ' '; 
+		$f->notes .= $this->_('If any one of them is always required to have changed, prepend a plus sign (+) to it, like this: +title.');
+		$f->collapsed = Inputfield::collapsedBlank;
+		$form->add($f); 
+
+		$actionsFieldset = $this->wire('modules')->get('InputfieldFieldset'); 
+		$actionsFieldset->attr('id+name', 'actions_config'); 
+		$actionsFieldset->label = $this->_('Action(s) Configuration'); 
+		$actionsFieldset->description = $this->_('These show custom configuration options specific to the actions you have selected above.'); 
+		$actionsFieldset->showIf = "actions.count>0";
+
+		$actionsField = $this->wire('modules')->get('InputfieldAsmSelect'); 
+		$actionsField->attr('name', 'actions'); 
+		$actionsField->label = $this->_('Action(s) to Run'); 
+		$actionsField->required = true; 
+		$actionsField->attr('value', $trigger->actions); 
+		$actionsField->notes = $this->_('Configuration options specific to each action.'); 
+
+		foreach($this->wire('modules') as $module) {
+
+			$className = $module->className();
+			if(!in_array('PageAction', class_parents($className))) continue; 
+			$info = $this->wire('modules')->getModuleInfo($module); 
+			if($module instanceof ModulePlaceholder) $module = $this->wire('modules')->get($className);
+			$actionLabel = $info['title'];
+
+			$settings = isset($trigger->settings[$className]) ? $trigger->settings[$className] : array();
+
+			foreach($settings as $key => $value) {
+				$module->set($key, $value); 
+			}
+
+			$actionInputfields = $module->getConfigInputfields();
+			if(count($actionInputfields)) {
+
+				$actionInputfields->showIf = "actions=$className";
+				$actionInputfields->collapsed = Inputfield::collapsedYes; 
+				if($actionInputfields->label) $actionLabel = $actionInputfields->label;
+
+				foreach($actionInputfields->getAll() as $f) {
+					$f->attr('name', $className . '__' . $f->attr('name')); // namespace it
+				}
+
+				$actionsFieldset->add($actionInputfields); 
+
+			}
+
+			$actionsField->addOption($className, $actionLabel); 
+		}
+
+		$form->add($actionsField); 
+		$form->add($actionsFieldset); 
+
+		$f = $this->wire('modules')->get('InputfieldRadios'); 
+		$f->attr('name', 'flag_when'); 
+		$f->label = $this->_('When should the action(s) run?'); 
+		$f->collapsed = Inputfield::collapsedYes; 
+		$f->addOption(IftTrigger::flagsBefore, $this->_('Immediately before the event is triggered')); 
+		$f->addOption(IftTrigger::flagsAfter, $this->_('Immediately after the event is triggered')); 
+		$f->addOption(IftTrigger::flagsLater, $this->_('Queue for later processing')); 
+		if($trigger->flags & IftTrigger::flagsBefore) $f->attr('value', IftTrigger::flagsBefore); 
+			else if($trigger->flags & IftTrigger::flagsAfter) $f->attr('value', IftTrigger::flagsAfter); 
+			else if($trigger->flags & IftTrigger::flagsLater) $f->attr('value', IftTrigger::flagsLater); 
+		$f->showIf = 'actions.count>0';
+		$form->add($f); 
+
+		/*
+		$f = $this->wire('modules')->get('InputfieldCheckbox'); 
+		$f->attr('name', 'flag_email'); 
+		$f->label = $this->_('Notify me by email when action(s) run'); 
+		$f->attr('value', IftTrigger::flagsEmail); 
+		if($trigger->flags & IftTrigger::flagsEmail) $f->attr('checked', 'checked'); 
+		$form->add($f); 
+		*/
+
+		if($trigger->id) { 
+			$f = $this->wire('modules')->get('InputfieldCheckbox'); 	
+			$f->attr('name', 'delete'); 
+			$f->label = $this->_('Delete?'); 
+			$f->description = $this->_('Check the box and click Delete to delete this trigger/action.'); 
+			$f->attr('value', $trigger->id); 
+			$f->collapsed = Inputfield::collapsedYes; 
+			$form->add($f); 
+		}
+
+		$f = $this->wire('modules')->get('InputfieldSubmit'); 
+		$f->attr('name', 'submit_save'); 
+		$f->class .= ' head_button_clone';
+		$f->attr('value', $this->_('Save')); 
+		$form->add($f); 
+
+		if($trigger->id) { 
+
+			$f = $this->wire('modules')->get('InputfieldSubmit'); 
+			$f->attr('name', 'submit_save_exit'); 
+			$f->attr('value', $this->_('Save + Exit')); 
+			$f->class .= ' ui-priority-secondary';
+			$form->add($f); 
+
+			$f = $this->wire('modules')->get('InputfieldSubmit'); 
+			$f->attr('name', 'submit_delete'); 
+			$f->attr('value', $this->_('Delete')); 
+			$f->class .= ' ui-priority-secondary';
+			$f->showIf = 'delete=' . $trigger->id;
+			$form->add($f); 
+		}
+
+		return $form; 
+	}
+
+	/**
+	 * Process and save the trigger edit form 
+	 *
+	 */
+	protected function ___processEdit(InputfieldForm $form, IftTrigger $trigger) {
+
+		$post = $this->wire('input')->post; 
+		$form->processInput($post); 
+		$flags = 0;
+		$actionSettings = array();
+
+		foreach($form->getAll() as $f) {
+
+			$name = $f->name; 
+			$new = $f->value; 
+
+			if(strpos($name, 'flag_') === 0) {
+				$flags = $flags | (int) $post->$name; 
+				$new = $flags; 
+				$name = 'flags';
+			} else if(strpos($name, '__')) {
+				// we'll process the action-specific settings later below
+				$actionSettings[$name] = $new; 
+				continue; 
+			}
+			
+			$old = $trigger->get($name);
+			if($old === null) continue; // if not a property of IftTrigger, skip
+			if($old != $new) { 
+				$trigger->set($name, $new); 
+			}
+		}
+
+		// action-specific settings
+		$settings = array(); 
+		foreach($trigger->actions as $action) {
+			$data = array();
+			foreach($actionSettings as $key => $value) {
+				$pos = strpos($key, $action . '__');
+				if($pos !== 0) continue; 
+				$name = substr($key, strlen($action)+2); 
+				$data[$name] = $value; 
+			}
+			if(count($data)) $settings[$action] = $data; 
+		}
+		$trigger->set('settings', $settings); 
+	}
+
+	/**
+	 * Display a table of queued actions with options to process the queue or delete individual items in queue
+	 *
+	 */
+	public function ___executeQueue() {
+
+		$this->processQueue();
+
+		$modules = $this->wire('modules'); 
+		$sanitizer = $this->wire('sanitizer');
+		$info = IftRunner::getModuleInfo();
+
+		$this->wire('breadcrumbs')->add(new Breadcrumb('../', $info['title'])); 
+		$this->wire('processHeadline', $this->_('Queue')); 
+
+		$form = $modules->get('InputfieldForm'); 
+		$markup = $modules->get('InputfieldMarkup'); 
+
+		$n = 0;
+		$table = $modules->get('MarkupAdminDataTable'); 
+		$table->setEncodeEntities(false);
+		$table->headerRow(array(
+			$this->_x('ID', 'th'),
+			$this->_x('Title', 'th'), 
+			$this->_x('Trigger', 'th'),
+			$this->_x('User', 'th'),
+			$this->_x('Action Module', 'th'),
+			$this->_x('# Items', 'th'),
+			$this->_x('Created', 'th'),
+			$this->_x('Del', 'th')
+			));	
+
+		$checkbox = $modules->get('InputfieldCheckbox'); 
+		$checkbox->attr('name', 'delete[]');
+		$checkbox->label = ' ';
+
+		foreach($this->ift->actions->getAll() as $action) {
+
+			$n++;
+			$user = $this->wire('users')->get($action->userID); 
+			$triggerTitle = $action->triggerID ? $action->trigger->title : $this->_('External');
+			$checkbox->attr('value', $action->id); 
+			$moduleInfo = $modules->getModuleInfo($action->moduleName); 
+
+			$actionID = $action->id; 
+			$groupID = $action->rootParentID ? $action->rootParentID : $action->id; 
+
+			if($actionID == $groupID) {
+				$actionID = "<strong>$actionID</strong>";
+				$groupID = "<i class='fa fa-angle-double-down'></i>";
+				$actionID = "<strong>$actionID</strong>"; 
+			} else {
+				$actionID = "<span class='detail'>$groupID.</span>$actionID";
+			}
+
+			$table->row(array(
+				$actionID,
+				$sanitizer->entities($action->title), 
+				$sanitizer->entities($triggerTitle), 
+				$user->name, 				
+				$moduleInfo['title'], 
+				count($action->itemIDs), 
+				date($this->labels['dateTimeFormat'], $action->created),
+				$checkbox->render()
+				));
+		}
+
+		if($n) {
+			$form->value = $table->render();
+
+			$submit = $this->wire('modules')->get('InputfieldSubmit');
+			$submit->attr('name', 'submit_process_queue'); 
+			$submit->attr('value', $this->_('Process Queue'));
+			$submit->addClass('head_button_clone');
+			$submit->icon = 'tasks';
+			$form->add($submit); 
+
+			$submit = $this->wire('modules')->get('InputfieldSubmit');
+			$submit->attr('name', 'submit_delete_queue'); 
+			$submit->attr('value', $this->_('Deleted Checked'));
+			$submit->addClass('ui-priority-secondary');
+			$submit->icon = 'times-circle';
+			$form->add($submit); 
+
+		} else {
+			$this->message($this->_('The queue is empty')); 
+			$this->wire('session')->redirect('../');
+		}
+
+		$notes = "<p><span class='detail'>" . 
+			$this->_('Processing the queue may be slow, please be patient. It is best to process the queue automatically at regular intervals with a CRON job, with a script containing this:') . 
+			"</span><br /><code>wire('modules')->get('IftRunner')->processQueue();</code></p>";
+			
+		return $form->render() . $notes;
+	}
+
+	/**
+	 * Process actions for the executeQueue() method
+	 *
+	 */
+	protected function ___processQueue() {
+
+		$post = $this->wire('input')->post; 
+
+		if($post->submit_process_queue) {
+			$this->ift->processQueue();
+			$this->wire('session')->redirect('./'); 
+
+		} else if($post->submit_delete_queue && count($post->delete)) {
+			foreach($post->delete as $actionID) {
+				$action = $this->ift->actions->get((int) $actionID); 
+				if($action) {
+					$this->ift->actions->delete($action); 
+					$this->message(sprintf($this->_('Deleted action %d'), (int) $actionID));
+				}
+			}
+			$this->wire('session')->redirect('./'); 
+		}
+
+	}
+
+	/**
+	 * Install ProcessIft
+	 *
+	 */
+	public function ___install() {
+
+		// create the page our module will be assigned to
+		$page = new Page();
+		$page->template = 'admin';
+		$page->name = self::pageName; 
+
+		// installs to the admin "Setup" menu ... change as you see fit
+		$page->parent = $this->pages->get($this->config->adminRootPageID)->child('name=setup');
+		$page->process = $this; 
+
+		// we will make the page title the same as our module title
+		// but you can make it whatever you want
+		$info = self::getModuleInfo();
+		$page->title = $info['title'];
+
+		// save the page
+		$page->save();
+
+		// tell the user we created this page
+		$this->message("<a href='$page->url'>" . $this->_('Click here to get started with Triggers and Actions') . "</a>", Notice::allowMarkup); 
+
+
+	}
+
+	/**
+	 * Uninstall ProcessIft
+	 *
+	 */
+	public function ___uninstall() {
+
+		// find the page we installed, locating it by the process field (which has the module ID)
+		// it would probably be sufficient just to locate by name, but this is just to be extra sure.
+		$moduleID = $this->modules->getModuleID($this); 
+		$page = $this->pages->get("template=admin, process=$moduleID, name=" . self::pageName); 
+
+		if($page->id) {
+			// if we found the page, let the user know and delete it
+			$this->message("Deleting Page: {$page->path}"); 
+			$page->delete();
+		}
+	}
+	
+}
+

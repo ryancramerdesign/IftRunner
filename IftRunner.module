@@ -1,0 +1,541 @@
+<?php
+
+/**
+ * If Then Action Runner
+ *
+ */
+
+class IftRunner extends WireData implements Module, ConfigurableModule {
+
+	public static function getModuleInfo() {
+		return array(
+			'title' => 'Ift Runner', 
+			'summary' => 'Install this module to enable "if then" triggers and actions.', 
+			'version' => 17, 
+			'author' => 'Avoine and ProcessWire', 
+			'singular' => true, 
+			'autoload' => true,
+			'requires' => array('InputfieldSelector', 'ProcessWire>=2.5.0'), 
+			'installs' => array('ProcessIft', 'IftActionHello'), 
+			'icon' => 'flask', 
+			); 
+	}
+
+	const debug = false; 
+
+	/**
+	 * Required DB schema version
+	 *
+	 */
+	const schemaVersion = 3; 
+
+	/**
+	 * @property IftTriggers
+	 *
+	 */
+	protected $triggers = null;
+
+	/**
+	 * @property IftActions
+	 *
+	 */
+	protected $actions = null;
+
+	/**
+	 * @property array Triggers indexed by hook ID
+	 *
+	 */
+	protected $hooksTriggers = array();
+
+	/**
+	 * Maximum number of items allowed to processed per queued action
+	 *
+	 */
+	protected $maxItemsPerAction = 350;
+
+	/**
+	 * True when a queue is being processed
+	 *
+	 * We use this to avoid our _run hook, preventing every completed action from always triggering more
+	 *
+	 */
+	protected $processing = false;
+
+	/**
+	 * Construct IftRunner
+	 *
+	 */
+	public function __construct() {
+		$this->triggers = new IftTriggers($this); 
+		$this->actions = new IftActions($this); 
+		$this->set('schemaVersion', 0); 
+		$this->set('iftDebug', 0); 
+	}
+
+	/**
+	 * Initialize IftRunner
+	 *
+	 */
+	public function init() {
+
+		$this->checkSchema();
+
+		// setup hooks for each trigger, all pointing to $this->_run()
+		foreach($this->triggers->getAll() as $trigger) {
+
+			if(!($trigger->flags & IftTrigger::flagsActive)) continue; 
+			$options = array(
+				'before' => $trigger->flags & IftTrigger::flagsBefore, 
+				'after' => ($trigger->flags & IftTrigger::flagsAfter || $trigger->flags & IftTrigger::flagsLater),
+				);
+			$hookID = $this->addHook($trigger->hook, $this, '_run', $options); 
+			$this->hooksTriggers[$hookID] = $trigger; 
+		}
+
+	}
+
+	/**
+	 * Adjust the condition selector string as needed for API compatibility
+	 *
+	 * @param string $condition
+	 * @return string
+	 *
+	 */
+	protected function condition($condition) {
+		$replacements = array(
+			'template=' => 'template.id=',
+			'parent=' => 'parent_id='
+			);
+		$condition = str_replace(array_keys($replacements), array_values($replacements), $condition); 
+		return $condition;
+	}
+
+	/**
+	 * Conditions for the fieldChanges property of the trigger
+	 *
+	 * @param Page $item
+	 * @param IftTrigger $trigger
+	 * @param array $debug
+	 * @return bool Whether to run or not
+	 *
+	 */
+	protected function _runCheckFieldChanges(Page $item, $trigger, HookEvent $event, array &$debug) {
+
+		if(!count($trigger->fieldChanges)) return true; 
+		$run = true; 
+		$changesMatched = array();
+
+		if($trigger->hook == 'Pages::saved') {
+			$changes = $event->arguments(1); 
+		} else {
+			$changes = $item->getChanges();
+		}
+
+		foreach($trigger->fieldChanges as $fieldName) {	
+
+			// field name with "+" prepended to them are required
+			$required = strpos($fieldName, '+') === 0;
+			if($required) $fieldName = ltrim($fieldName, '+'); 
+
+			if(in_array($fieldName, $changes)) {
+				// property changed
+				$changesMatched[$fieldName] = $fieldName;
+				$debug[] = "YES: '$fieldName' changed " . ($required ? "and is required" : ""); 
+				continue; 
+
+			} else {
+				// property did not change
+				if($required) {
+					$run = false;
+					$debug[] = "NO: '$fieldName' did not change and is required"; 
+					break;
+				} else {
+					$debug[] = "OK: '$fieldName' didn't change, but it's not required"; 
+				}
+			}
+		}
+
+		if($run && !count($changesMatched)) {
+			$run = false;
+			$debug[] = "NO: No fields in our list changed";
+		}
+
+		return $run;
+	}
+
+	/**
+	 * Serves as the hook for all assigned triggers
+	 *
+	 * @param HookEvent $event
+	 *
+	 */
+	public function _run(HookEvent $event) { 
+
+		if($this->processing) return;
+
+		$trigger = $this->hooksTriggers[$event->id]; 
+		$run = true; 
+		$debug = array();
+		$changes = array();
+
+		// first we attempt to use argument 0 as the item
+		$item = $event->arguments(0); 
+
+		// if that item isn't the type we want, we attempt to look for it elsewhere
+		if(!$item || !$item instanceof Page) {
+			if($event->object instanceof Page) $item = $event->object; // i.e. Page::render
+		}
+
+		// check of any fieldChanges were specified and make sure this condition matches too
+		if(count($trigger->fieldChanges) && $item instanceof Page) {
+			$run = $this->_runCheckFieldChanges($item, $trigger, $event, $debug); 
+		}
+	
+		// if condition doesn't match, then don't continue
+		if($run && $trigger->condition) {
+
+			if($item instanceof Page) { 
+
+				$condition = $this->condition($trigger->condition); 
+				$debugStr = "Condition '$trigger->condition'";
+
+				if($item->matches($condition)) {
+					$debug[] = "YES: $debugStr matched";
+				} else {
+					$debug[] = "NO: $debugStr did not match";
+					$run = false;
+				}
+
+			} else {
+				// optionally add support for non-Page types in the future
+				$run = false;
+			}
+		} else {
+			// no conditions, so run it
+		}
+
+
+		if($run) try { 
+
+			$actions = $this->triggers->getActions($trigger); 
+			$later = $trigger->flags & IftTrigger::flagsLater;
+			$prevAction = null;
+			
+			foreach($actions as $action) {
+				if($later) {
+					$prevAction = $this->queueAction($action, array($item), $prevAction); 
+				} else {
+					$this->runAction($action, array($item), $event); 
+				}
+			}
+
+		} catch(Exception $e) {
+			$this->error($e->getMessage()); 
+		}
+
+		if(count($debug)) {
+			$path = $item instanceof Page ? $item->path() : '';
+			$html = "<p>" . implode("</p><p>", $debug) . "</p>";
+			if($path) $html = "<p>Page: $path</p>$html";
+			$title = $run ? "RUN" : "SKIP";
+			$title = "$title trigger #$trigger->id '$trigger->title' ($trigger->hook)";
+			$this->debugMessage($title, $html); 
+		}
+	}
+
+	/**
+	 * Queue an action to be run later
+	 *
+	 * @param IftAction $action Action to queue
+	 * @param array|PageArray $items Items to queue, that the action will run upon
+	 * @param IftAction $parent The parent of this action, if there is one
+	 * @return IftAction|null The action that was queued or null on failure
+	 * @throws WireException if you try to queue too many items in an action. 
+	 *
+	 */
+	public function queueAction(IftAction $action, $items, IftAction $parent = null) {
+
+		if(count($items) > $this->maxItemsPerAction) {
+			throw new WireException("You may only queue a max of $this->maxItemsPerAction per action."); 
+		}
+
+		$itemIDs = array();
+		if($items instanceof PageArray) {
+			$itemIDs = $items->explode('id'); 
+
+		} else foreach($items as $item) {
+			if(!is_object($item)) $itemIDs[] = (int) $item;
+				else if($item instanceof Page) $itemIDs[] = $item->id; 
+		}
+
+		$action->itemIDs = $itemIDs; 
+
+		if(is_null($parent)) {
+			// this action is the first in it's group, or the only in it's group
+			$action->set('parentID', 0); 
+			$action->set('rootParentID', 0); 
+			
+		} else if($parent->id) {
+			// this action has a parent and rootParent
+			$action->set('parentID', $parent->id); 
+			do {
+				$p = $parent->parent; 
+				if($p && $p->id) $parent = $p;
+			} while($p); 
+			$action->set('rootParentID', $parent->id); 
+		}
+
+		$this->actions->save($action); // add to the queue
+		$this->debugMessage("$action->triggerID: Queuing Action #$action->id ($action->moduleName) for items " . implode('|', $itemIDs)); 
+
+		return $action;
+	}
+
+	/**
+	 * Process queued actions
+	 *
+	 * This would be typically called via the API from a CRON job, i.e. 
+	 * $modules->get('IftRunner')->processQueue();
+	 *
+	 * @param int $max Maximum number of actions to process in one request. 
+	 * @return int Number of actions processed
+	 *
+	 */
+	public function processQueue($max = 0) {
+
+		$actions = $this->actions->getAll();
+		$batches = array();
+		$user = $this->wire('user'); 
+		$_user = $user; // saved user to restore later
+		$idStrPrev = '';
+		$items = array();
+		$numItemsProcessed = 0; 
+		set_time_limit(0); 
+		$actionCnt = 0; 
+		
+		foreach($actions as $action) {
+			$actionCnt++;
+
+			if($user->id != $action->userID) {
+				$user = $this->wire('users')->get($action->userID); 
+				$this->wire('session')->setCurrentUser($user); 
+				//if(!isset($notices[$user->id])) $notices[$user->id] = array();
+			}
+
+			$idStr = md5(implode('|', $action->itemIDs)); 
+			$n = count($action->itemIDs); 
+			$this->message("Running queued action '$action->moduleName' for user '$user->name' on $n item(s)."); 
+
+			if($idStr != $idStrPrev) {
+				// clear the Pages cache if we're dealing with larger quantities
+				if($numItemsProcessed >= $this->maxItemsPerAction) $this->wire('pages')->uncacheAll();
+			
+				// load new items if next set is not the same as previous
+				$items = $this->wire('pages')->getById($action->itemIDs); 
+			}
+
+			if($this->runAction($action, $items)) {
+				$batchID = $action->rootParentID ? $action->rootParentID : $action->id; 
+				$batches[$batchID][$action->id] = $action;
+				$this->actions->delete($action); 
+			}
+
+			$numItemsProcessed += count($items); 
+			$idStrPrev = $idStr; 
+			if($max && $actionCnt > $max) break;
+		}
+
+		if($user->id != $_user->id) $this->wire('session')->setCurrentUser($_user); 
+
+		$this->processQueueNotices($batches);
+
+		return $actionCnt; 
+	}
+
+
+	/**
+	 * Companion to processQueue that sends summaries to users of what was done
+	 *
+	 * @param array $batches array('batch ID' => array('action ID' => $action))
+	 *				
+	 */
+	protected function processQueueNotices(array $batches) {
+
+		$emails = array();
+
+		// construct a list of notices indexed by user
+		foreach($batches as $batchID => $batch) {
+			$lastAction = null; // last action in batch
+			$numItems = 0; 
+			foreach($batch as $action) {
+				$numItems += count($action->itemIDs); 
+				$lastAction = $action;
+			}
+			$action = $lastAction;
+			$moduleInfo = $this->wire('modules')->getModuleInfo($action->moduleName); 
+			$notice = "$moduleInfo[title] (" . sprintf($this->_n('%d item', '%d items', $numItems), $numItems) . ") $action->title "; 
+			if($action->summary) $notice .= "\n" . $action->summary; 	
+			if($action->flags & IftAction::flagsEmail) { 
+				if(!is_array($emails[$action->userID])) $emails[$action->userID] = array();
+				$emails[$action->userID][] = $notice; 
+			}
+		}
+
+		// send 1 email to each user that has pending notices
+		foreach($emails as $userID => $userNotices) {
+			if(!count($userNotices)) continue; 
+			$user = $this->wire('users')->get($userID); 
+			if(!$user->id || !$user->email) continue; 
+			$subject = $this->_('Completed Actions');
+			$body = $this->_('The following actions have been completed:') . "\n\n";
+			foreach($userNotices as $notice) $body .= "$notice\n\n";
+			wireMail($user->email, $this->config->httpHost . " <$user->email>", $subject, $body); 
+			$this->message($this->_('Dispatched notification email') . ' - ' . $user->email . ' - ' . $subject); 
+		}
+	}
+
+	/**
+	 * Run an action now
+	 *
+	 * @param IftAction $action Action to run
+	 * @param array|PageArray $items Items the action should run upon
+	 * @param HookEvent $event Optional hook event to send to the action (if it wants it)
+	 * @return int Number of items actions were performed on
+	 *
+	 */
+	protected function runAction(IftAction $action, $items, HookEvent $event = null) {
+
+		$this->processing = true; 
+		$module = $this->wire('modules')->get($action->moduleName); 
+		if(!$module || !$module instanceof PageAction) return 0; 
+
+		$module->setRunner($this); 
+
+		foreach($action->settings as $key => $value) {
+			$module->set($key, $value); 
+		}
+
+		// execute the action
+		$actionID = $action->id ? "#$action->id " : "";
+		$this->debugMessage("Running Action $actionID ($module)"); 
+
+		if($module instanceof IftActionModule) { 
+			// this may not ultimately be needed - to be determined later
+			$module->setIftAction($action); 
+			if($event) $module->setHookEvent($event); 
+		} else {
+			// set them to the module in case it wants to use them
+			$module->iftAction = $action; 
+			if($event) $module->iftHookEvent = $event; 
+		}
+
+		$result = 0;
+
+		try { 
+			$result = $module->executeMultiple($items);
+			foreach($items as $item) {
+				if($item->id && $item->isChanged()) {
+					$this->wire('pages')->save($item, array('uncacheAll' => false)); 
+				}
+			}
+
+			$action->completed = true; 
+			$action->summary = $module->summary();
+			
+		} catch(Exception $e) {
+			$this->error($e->getMessage()); 
+			
+		}
+
+		$this->processing = false; 
+
+		return $result;
+		
+	}
+
+	/**
+	 * Check DB schema versions and update when necessary
+	 *
+	 */
+	protected function checkSchema() {
+
+		if($this->schemaVersion >= self::schemaVersion) return;
+
+		try {
+			$this->actions->checkSchema();
+			$this->triggers->checkSchema();
+			$this->message("Updated schema version from $this->schemaVersion to " . self::schemaVersion); 
+			$data = $this->wire('modules')->getModuleConfigData($this);
+			$this->schemaVersion = self::schemaVersion;  
+			$data['schemaVersion'] = $this->schemaVersion;
+			$this->wire('modules')->saveModuleConfigData($this, $data); 
+
+		} catch(Exception $e) {
+			$this->error($e->getMessage());
+		}
+	}
+
+	public function ___install() {
+		try { $this->triggers->install(); } catch(Exception $e) { $this->error($e->getMessage()); }
+		try { $this->actions->install(); } catch(Exception $e) { $this->error($e->getMessage()); }
+	}
+
+	public function ___uninstall() {
+		try { $this->triggers->uninstall(); } catch(Exception $e) { $this->error($e->getMessage()); }
+		try { $this->actions->uninstall(); } catch(Exception $e) { $this->error($e->getMessage()); }
+	}
+
+	public function debugMessage($title, $html = '') {
+		if(!$this->iftDebug) return;
+
+		// static $notifications = false;
+		// if($notifications === false) $notifications = $this->wire('user')->notifications;
+
+		if($html) $title = "$title: $html";
+		$this->message("IftRunner (debug mode): $title", Notice::debug | Notice::allowMarkup); 
+
+		/*
+		if($notifications) {
+			$processing = $this->processing;
+			$this->processing = true; // to prevent getting debug messages about notification save
+			$notification = $notifications->getNew('message markup');
+			$notification->title = "IftRunner: $title"; 
+			if($html) $notification->html = $html; 
+			$moduleInfo = self::getModuleInfo();
+			$notification->icon = $moduleInfo['icon']; 
+			$notification->expires = 30; 
+			$notifications->save();
+			$this->processing = $processing;
+		} else {
+			if($html) $title = "$title: $html";
+			$this->message("IftRunner: $title", Notice::debug | Notice::allowMarkup); 
+		}
+		*/
+	}
+
+	public function __get($key) {
+		if($key == 'triggers') return $this->triggers; 
+		if($key == 'actions') return $this->actions; 
+		return parent::__get($key); 
+	}
+
+	public static function getModuleConfigInputfields(array $data) {
+		$inputfields = new InputfieldWrapper();
+		$f = wire('modules')->get('InputfieldCheckbox');	
+		$f->attr('name', 'iftDebug');
+		$f->label = __('Enable Debug Mode?');
+		$f->description = __('When checked, verbose notifications will be shown from IftRunner.'); 
+		$f->collapsed = Inputfield::collapsedBlank;
+		if(!empty($data['iftDebug'])) $f->attr('checked', 'checked');
+		$inputfields->add($f);
+		return $inputfields; 
+	}
+
+}
+
+require_once(__DIR__ . '/IftTrigger.php'); 
+require_once(__DIR__ . '/IftTriggers.php'); 
+require_once(__DIR__ . '/IftAction.php'); 
+require_once(__DIR__ . '/IftActions.php'); 
+require_once(__DIR__ . '/IftActionModule.php'); 
+
